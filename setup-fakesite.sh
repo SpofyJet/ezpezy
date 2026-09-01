@@ -19,7 +19,7 @@ HTML_DIR="$APP_DIR/html"
 LOG_DIR="$APP_DIR/logs"
 DATA_DIR="$APP_DIR/data"
 BIN_PATH="/usr/local/bin/selfsteal"
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.1"
 
 err() { echo -e "${RED}✗ $1${NC}" >&2; exit 1; }
 ok()  { echo -e "${GREEN}✓ $1${NC}"; }
@@ -52,6 +52,8 @@ check_dns() {
     local domain=$1
     local server_ip=$(curl -s --max-time 5 -4 https://api.ipify.org 2>/dev/null || curl -s --max-time 5 -4 https://ifconfig.me 2>/dev/null)
     local domain_ip=$(dig +short A "$domain" @1.1.1.1 2>/dev/null | tail -1)
+    # fallback, если dig не установлен (минимальные образы без dnsutils)
+    [[ -z "$domain_ip" ]] && domain_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
 
     [[ -z "$server_ip" ]] && err "Не могу определить IP сервера"
     [[ -z "$domain_ip" ]] && err "DNS A-записи для $domain не найдено"
@@ -744,6 +746,9 @@ services:
     image: caddy:2-alpine
     container_name: selfsteal-caddy
     restart: always
+    # tini как PID 1: реапит осиротевших потомков healthcheck,
+    # иначе caddy (PID 1) их не ждёт и копятся zombie-процессы
+    init: true
     network_mode: host
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
