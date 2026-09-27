@@ -60,7 +60,7 @@ cdn.example.com   A   <IP сервера>   TTL 300
 dig +short cdn.example.com
 ```
 
-Должен вернуть IP сервера.
+Должен вернуть IP сервера (любой из его адресов, если их несколько).
 
 ### 2. Запусти скрипт
 
@@ -72,6 +72,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/SpofyJet/ezpezy/main/install.s
 - Домен (например `cdn.example.com`)
 - Как Xray обращается к fakesite: `127.0.0.1:порт` (по умолчанию 8443) или unix-сокет
 - Шаблон сайта
+- Если на сервере есть remnanode — настроить ли сертификат этого домена для Hysteria2 (см. ниже)
 
 Порт **80 должен быть открыт снаружи** (UFW / фаервол провайдера) — через него Let's Encrypt выдаёт сертификат.
 
@@ -177,6 +178,32 @@ docker compose up -d
 
 и `docker compose up -d`. Быстрее, чем `127.0.0.1:8443`, это не делает (замер одинаковый) — плюс только в
 том, что у fakesite нет TCP-порта.
+
+---
+
+## 🚀 Hysteria2: сертификат этого домена
+
+Инбаунду Hysteria2 в Remnawave нужен TLS-сертификат — файлы `certFile`/`keyFile` внутри контейнера
+remnanode. На ноде с selfsteal можно взять сертификат Let's Encrypt, который Caddy уже получил для домена:
+
+```bash
+selfsteal hy2          # или при установке ответить «y» на вопрос про Hysteria2 (SELFSTEAL_HY2=1)
+```
+
+- копирует сертификат в `/etc/hysteria2/certs/` под теми именами, что указаны в панели: имена берутся
+  из ошибки Xray в логах remnanode, иначе `fullchain.pem` / `private.key` (или `SELFSTEAL_HY2_CERT` /
+  `SELFSTEAL_HY2_KEY`);
+- подключает `/etc/hysteria2/certs` в контейнер remnanode (только чтение) — в `docker-compose.yml`
+  (резервная копия, проверка `docker compose config`, при ошибке откат). Без этого файлы, положенные
+  внутрь контейнера, пропадают при его пересоздании;
+- перезапускает remnanode и проверяет, что Xray поднялся; если панель ждёт другие имена файлов —
+  копирует под ними и перезапускает ещё раз;
+- ежедневно (`/etc/cron.daily/selfsteal-hy2`) переносит продлённый Caddy сертификат и перезапускает
+  remnanode — только когда сертификат поменялся (примерно раз в 60 дней).
+
+В панели (инбаунд Hysteria2): `certFile` `/etc/hysteria2/certs/fullchain.pem`, `keyFile`
+`/etc/hysteria2/certs/private.key` (или ваши имена — скрипт выведет итоговые). Выключить продление:
+`selfsteal hy2 off`.
 
 ---
 

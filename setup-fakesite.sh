@@ -20,13 +20,17 @@ LOG_DIR="$APP_DIR/logs"
 DATA_DIR="$APP_DIR/data"
 BIN_PATH="/usr/local/bin/selfsteal"
 SOCK_PATH="/dev/shm/selfsteal.sock"
-SCRIPT_VERSION="3.2"
+HY2_BIN="/usr/local/sbin/selfsteal-hy2"
+RN_COMPOSE="/opt/remnanode/docker-compose.yml"
+SCRIPT_VERSION="3.3"
 # v3.2: HTTPS fakesite слушает ТОЛЬКО 127.0.0.1 (или unix-сокет) — наружу открыт лишь :80 для
 # Let's Encrypt. HTTP/3 (UDP) выключен: REALITY ходит к dest только по TCP, а UDP-сокет Caddy
 # на 443 конфликтовал бы с Hysteria2. Неинтерактивный запуск — переменные SELFSTEAL_*:
 #   SELFSTEAL_DOMAIN, SELFSTEAL_MODE=tcp|unix, SELFSTEAL_PORT (tcp, по умолчанию 8443), SELFSTEAL_TEMPLATE=1..6
 # Только для тестового стенда: SELFSTEAL_TLS_INTERNAL=1 (сертификат своего CA Caddy, без Let's Encrypt),
 # SELFSTEAL_SKIP_DNS=1 (без проверки A-записи).
+# v3.3: если на сервере есть remnanode — вопрос «сертификат этого домена для Hysteria2?»
+# (SELFSTEAL_HY2=1|0; имена файлов — SELFSTEAL_HY2_CERT / SELFSTEAL_HY2_KEY). Потом: selfsteal hy2.
 
 err() { echo -e "${RED}✗ $1${NC}" >&2; exit 1; }
 ok()  { echo -e "${GREEN}✓ $1${NC}"; }
@@ -58,19 +62,29 @@ install_docker_if_needed() {
 check_dns() {
     local domain=$1
     if [[ "${SELFSTEAL_SKIP_DNS:-0}" == "1" ]]; then warn "Проверка DNS пропущена (SELFSTEAL_SKIP_DNS=1)"; return; fi
-    local server_ip=$(curl -s --max-time 5 -4 https://api.ipify.org 2>/dev/null || curl -s --max-time 5 -4 https://ifconfig.me 2>/dev/null)
+    # v3.3: все IPv4 сервера — внешний (ipify) + адреса на интерфейсах. Раньше сравнивался только
+    # внешний: на сервере с дополнительным IP домен на втором адресе ошибочно считался «чужим»
+    local public_ip=$(curl -s --max-time 5 -4 https://api.ipify.org 2>/dev/null || curl -s --max-time 5 -4 https://ifconfig.me 2>/dev/null)
+    local server_ips=$( { grep -E '^[0-9.]+$' <<<"$public_ip"; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'; } | sort -u)
     # v3.2: ВСЕ A-записи (раньше — только последняя: при нескольких записях проверка была лотереей)
     local domain_ips=$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | sort -u)
     # fallback, если dig не установлен (минимальные образы без dnsutils)
     [[ -z "$domain_ips" ]] && domain_ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
 
-    [[ -z "$server_ip" ]] && err "Не могу определить IP сервера"
+    [[ -z "$server_ips" ]] && err "Не могу определить IP сервера"
     [[ -z "$domain_ips" ]] && err "DNS A-записи для $domain не найдено"
 
-    echo "  IP сервера:  $server_ip"
+    echo "  IP сервера:  $(echo $server_ips)"
     echo "  A-записи:    $(echo $domain_ips)"
-    grep -qx "$server_ip" <<<"$domain_ips" || err "Ни одна A-запись $domain не указывает на этот сервер"
-    [[ $(wc -l <<<"$domain_ips") -gt 1 ]] && warn "У домена несколько A-записей — Let's Encrypt может проверить другой IP"
+    if [[ -z "$(comm -12 <(echo "$server_ips") <(echo "$domain_ips"))" ]]; then
+        # IP за NAT провайдера может не быть ни на интерфейсе, ни во внешней проверке
+        warn "Ни одна A-запись $domain не совпадает с IP этого сервера"
+        local ans=n
+        [[ -t 0 ]] && read -rp "  Домен точно указывает на этот сервер (IP за NAT)? Продолжить? [y/N]: " ans
+        [[ "$ans" =~ ^[yYдД] ]] || err "Направьте A-запись $domain на этот сервер (или SELFSTEAL_SKIP_DNS=1, если IP за NAT)"
+        warn "Продолжаю по подтверждению: если домен ведёт не сюда, Let's Encrypt не выдаст сертификат"
+        return
+    fi
     ok "DNS корректный"
 }
 
@@ -895,13 +909,20 @@ case "$1" in
             curl -sI $k --max-time 5 --resolve "${SELF_STEAL_DOMAIN}:${SELF_STEAL_PORT}:127.0.0.1" "https://${SELF_STEAL_DOMAIN}:${SELF_STEAL_PORT}/" | head -5
         fi
         ;;
+    hy2)          # сертификат домена -> Hysteria2 в remnanode (selfsteal hy2 off — выключить продление)
+        [ "${2:-}" = off ] && exec /usr/local/sbin/selfsteal-hy2 off
+        source "$APP_DIR/.env"; exec /usr/local/sbin/selfsteal-hy2 setup "$SELF_STEAL_DOMAIN" ;;
     edit)         ${EDITOR:-nano} "$APP_DIR/Caddyfile" && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile ;;
     uninstall)
         read -rp "Точно удалить selfsteal? [y/N]: " c
         [[ "$c" =~ ^[Yy]$ ]] || exit 0
         docker compose down -v 2>/dev/null
+        if [ -f /etc/selfsteal-hy2.conf ]; then
+            /usr/local/sbin/selfsteal-hy2 off >/dev/null 2>&1 || true
+            echo "Сертификат Hysteria2 в /etc/hysteria2/certs больше не будет продлеваться"
+        fi
         rm -rf "$APP_DIR"
-        rm -f /usr/local/bin/selfsteal /dev/shm/selfsteal.sock
+        rm -f /usr/local/bin/selfsteal /dev/shm/selfsteal.sock /usr/local/sbin/selfsteal-hy2
         echo "Удалено."
         ;;
     *)
@@ -921,12 +942,168 @@ selfsteal — управление Reality fakesite
   env           показать .env
   test          curl -I на свой домен
   edit          редактировать Caddyfile + reload
+  hy2 [off]     сертификат домена для Hysteria2 в remnanode (+ автопродление) / выключить
   uninstall     удалить всё
 HELP
         ;;
 esac
 CLI
     chmod +x "$BIN_PATH"
+}
+
+# write_hy2_tool — /usr/local/sbin/selfsteal-hy2: сертификат Caddy -> Hysteria2 (remnanode) + продление
+write_hy2_tool() {
+    cat > "$HY2_BIN" << 'HY2TOOL'
+#!/bin/bash
+# selfsteal-hy2 — сертификат selfsteal (Caddy, Let's Encrypt) для Hysteria2 в remnanode. Ставится selfsni.
+#   selfsteal-hy2 setup <домен>  скопировать сертификат в /etc/hysteria2/certs, подключить папку в
+#                                remnanode (docker-compose.yml: резервная копия, проверка, откат),
+#                                перезапустить ноду, включить ежедневную синхронизацию
+#   selfsteal-hy2 sync           (cron.daily) после продления Caddy — новый сертификат + перезапуск remnanode
+#   selfsteal-hy2 off            выключить синхронизацию (файлы и подключение папки остаются)
+# Имена файлов: SELFSTEAL_HY2_CERT / SELFSTEAL_HY2_KEY, иначе — из ошибки Xray в логах remnanode,
+# иначе fullchain.pem / private.key. Они должны совпадать с certFile/keyFile инбаунда Hysteria2 в панели.
+set -euo pipefail
+T=/etc/hysteria2/certs; CONF=/etc/selfsteal-hy2.conf; CRON=/etc/cron.daily/selfsteal-hy2
+CERTS=/opt/selfsteal/data/certificates
+COMPOSE="${REMNANODE_COMPOSE:-/opt/remnanode/docker-compose.yml}"; DC="$(dirname "$COMPOSE")"
+die() { echo "✗ $*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "нужен root"
+
+src() { ls -d "$CERTS"/*/"$1" 2>/dev/null | head -1; }
+# copy <домен> <crt> <key>
+copy() {
+    local d; d="$(src "$1")"
+    [ -n "$d" ] && [ -s "$d/$1.crt" ] && [ -s "$d/$1.key" ] || return 1
+    mkdir -p "$T"
+    install -m 0644 "$d/$1.crt" "$T/$2"
+    install -m 0600 "$d/$1.key" "$T/$3"
+}
+xlogs() { ( cd "$DC" && docker compose logs "$@" 2>&1 | tr -d '\000' ) || true; }
+# имя файла из «failed to parse <certificate|key> > open /etc/hysteria2/certs/<имя>: no such file»
+missing() { xlogs "${@:2}" | { grep -o "failed to parse $1 > open $T/[^:/ ]*" || true; } | tail -1 | sed 's|.*/||'; }
+
+# mount — /etc/hysteria2/certs в сервис remnanode (только чтение), один раз
+mount_certs() {
+    if grep -q "$T:$T" "$COMPOSE"; then echo "  папка уже подключена в remnanode"; return; fi
+    command -v python3 >/dev/null || die "нужен python3 для правки $COMPOSE"
+    local bak; bak="$COMPOSE.bak-hy2-$(date +%Y%m%d-%H%M%S)"; cp -a "$COMPOSE" "$bak"
+    python3 - "$COMPOSE" "$T" <<'PY'
+import re, sys
+p, t = sys.argv[1], sys.argv[2]
+lines = open(p).read().split("\n")
+i = next((k for k, l in enumerate(lines) if re.match(r"^(\s+)remnanode:\s*$", l)), None)
+if i is None: sys.exit("в compose нет сервиса remnanode")
+ind = len(lines[i]) - len(lines[i].lstrip()); child = None; end = len(lines)
+for k in range(i + 1, len(lines)):
+    l = lines[k]
+    if l.strip() == "" or l.lstrip().startswith("#"): continue
+    cur = len(l) - len(l.lstrip())
+    if cur <= ind: end = k; break
+    if child is None: child = cur
+if child is None: sys.exit("пустой сервис remnanode")
+item = " " * (child + 2) + "- %s:%s:ro" % (t, t)
+vol = next((k for k in range(i + 1, end) if re.match(r"^\s{%d}volumes:\s*$" % child, lines[k])), None)
+if vol is not None: lines.insert(vol + 1, item)
+else: lines[i + 1:i + 1] = [" " * child + "volumes:", item]
+open(p, "w").write("\n".join(lines))
+PY
+    ( cd "$DC" && docker compose config -q ) || { cp -a "$bak" "$COMPOSE"; die "compose после правки не проходит проверку — вернул как было ($bak)"; }
+    echo "  папка подключена в remnanode (резервная копия: $bak)"
+}
+
+# restart_check — перезапуск remnanode; 0 = Xray поднялся, 2 = нет файла <имя> (в $want), 1 = другое
+restart_check() {
+    local since err i
+    since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    ( cd "$DC" && docker compose up -d && docker compose restart remnanode ) >/dev/null 2>&1 || die "docker compose не смог перезапустить remnanode"
+    for i in $(seq 1 30); do
+        sleep 3
+        err="$(xlogs --since "$since" | grep -m1 -o 'failed to build inbound config with tag [^ ]* > .*' || true)"
+        if [ -n "$err" ]; then
+            want_crt="$(missing certificate --since "$since")"; want_key="$(missing key --since "$since")"
+            [ -n "$want_crt$want_key" ] && return 2
+            echo "  Xray не запустился: ${err%% - \{*}" >&2; return 1
+        fi
+        ss -Htulnp 2>/dev/null | grep -q 'rw-core\|xray' && return 0
+    done
+    echo "  за 90 с Xray не открыл порты и ошибок не написал: cd $DC && docker compose logs --tail 50" >&2; return 1
+}
+
+cmd_setup() {
+    local domain="${1:?домен}" crt key i rc
+    [ -f "$COMPOSE" ] || die "нет $COMPOSE — remnanode не установлен?"
+    local HY2_CERT="" HY2_KEY=""
+    # shellcheck source=/dev/null
+    [ -f "$CONF" ] && . "$CONF"   # повторный запуск — прежние имена файлов
+    crt="${SELFSTEAL_HY2_CERT:-$(missing certificate --tail 300)}"; crt="${crt:-${HY2_CERT:-fullchain.pem}}"
+    key="${SELFSTEAL_HY2_KEY:-$(missing key --tail 300)}"; key="${key:-${HY2_KEY:-private.key}}"
+    echo "→ Hysteria2: сертификат $domain -> $T/$crt, ключ -> $T/$key"
+    for i in $(seq 1 30); do copy "$domain" "$crt" "$key" && break; [ "$i" = 30 ] && die "сертификата $domain у Caddy ещё нет (selfsteal logs; порт 80 открыт снаружи?) — повторите позже: selfsteal hy2"; sleep 3; done
+    openssl x509 -in "$T/$crt" -noout -enddate 2>/dev/null | sed 's/^notAfter=/  действует до: /' || true
+    mount_certs
+    echo "→ перезапуск remnanode (клиенты переподключатся)"
+    for i in 1 2; do
+        want_crt=""; want_key=""; rc=0; restart_check || rc=$?
+        [ "$rc" = 2 ] && [ "$i" = 1 ] || break
+        # панель ждёт другие имена файлов — берём их из ошибки Xray и перезапускаем ещё раз
+        crt="${want_crt:-$crt}"; key="${want_key:-$key}"
+        echo "  панель ждёт файлы $T/$crt и $T/$key — копирую под этими именами"
+        copy "$domain" "$crt" "$key"
+    done
+    [ "$rc" = 0 ] || die "Hysteria2 не поднялся — сверьте certFile/keyFile в панели: $T/$crt и $T/$key"
+    ss -Hulnp 2>/dev/null | grep -E 'rw-core|xray' | awk '{print "  UDP: " $4}' | head -3
+    printf 'HY2_DOMAIN=%q\nHY2_CERT=%q\nHY2_KEY=%q\n' "$domain" "$crt" "$key" > "$CONF"
+    printf '#!/bin/sh\n# selfsni: сертификат Caddy -> Hysteria2 (remnanode) после продления\nexec /usr/local/sbin/selfsteal-hy2 sync\n' > "$CRON"
+    chmod 0755 "$CRON"
+    rm -f /etc/cron.daily/hy2-cert-sync   # старый вариант (fix-hy2-cert.sh)
+    echo "✓ Hysteria2 использует сертификат $domain; продление — автоматически (cron.daily)"
+    echo "  в панели (инбаунд Hysteria2): certFile $T/$crt · keyFile $T/$key"
+}
+
+cmd_sync() {
+    [ -f "$CONF" ] || exit 0
+    # shellcheck source=/dev/null
+    . "$CONF"
+    local d; d="$(src "$HY2_DOMAIN")"
+    [ -n "$d" ] && [ -s "$d/$HY2_DOMAIN.crt" ] || exit 0
+    cmp -s "$d/$HY2_DOMAIN.crt" "$T/$HY2_CERT" && cmp -s "$d/$HY2_DOMAIN.key" "$T/$HY2_KEY" && exit 0
+    copy "$HY2_DOMAIN" "$HY2_CERT" "$HY2_KEY"
+    ( cd "$DC" && docker compose restart remnanode ) >/dev/null 2>&1
+    logger -t selfsteal-hy2 "сертификат $HY2_DOMAIN обновлён для Hysteria2, remnanode перезапущен" || true
+}
+
+case "${1:-}" in
+    setup) cmd_setup "${2:-}" ;;
+    sync)  cmd_sync ;;
+    off)   rm -f "$CRON" "$CONF"; echo "синхронизация выключена (файлы в $T и подключение папки остались)" ;;
+    *)     sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
+esac
+HY2TOOL
+    chmod 0755 "$HY2_BIN"
+}
+
+# ask_hy2 — есть remnanode: спросить, отдать ли сертификат домена Hysteria2 (WANT_HY2=1)
+ask_hy2() {
+    WANT_HY2=0
+    [[ -f "$RN_COMPOSE" ]] || return 0
+    local a="${SELFSTEAL_HY2:-}"
+    if [[ -z "$a" && -f /etc/selfsteal-hy2.conf ]]; then
+        a=1; info "Hysteria2 уже берёт сертификат selfsteal — переключу на $DOMAIN"
+    elif [[ -z "$a" && -t 0 ]]; then
+        echo ""
+        echo -e "${GRAY}Hysteria2 (инбаунд в Remnawave) нужен TLS-сертификат. Можно взять сертификат этого домена:${NC}"
+        echo -e "${GRAY}он попадёт в /etc/hysteria2/certs, папка подключится в remnanode, продление — автоматически.${NC}"
+        read -rp "Настроить сертификат для Hysteria2? [y/N]: " a
+    fi
+    [[ "$a" =~ ^[1yYдД] ]] && WANT_HY2=1
+    return 0
+}
+
+run_hy2() {
+    echo ""
+    info "Hysteria2: сертификат $DOMAIN для remnanode..."
+    "$HY2_BIN" setup "$DOMAIN" || warn "Hysteria2 не настроен (см. выше). Повторить: selfsteal hy2"
 }
 
 # ============================================
@@ -966,6 +1143,7 @@ cmd_install() {
     fi
 
     choose_template
+    ask_hy2
 
     info "Проверяю DNS..."
     check_dns "$DOMAIN"
@@ -996,6 +1174,7 @@ cmd_install() {
     write_compose "$MODE"
     write_env "$DOMAIN" "$MODE" "$PORT"
     install_cli
+    write_hy2_tool
 
     info "Запускаю Docker..."
     cd "$APP_DIR"
@@ -1039,8 +1218,23 @@ cmd_install() {
     fi
     echo ""
     echo -e "${GRAY}Управление:${NC}"
-    echo -e "  ${CYAN}selfsteal status${NC}  | ${CYAN}logs${NC} | ${CYAN}test${NC} | ${CYAN}restart${NC} | ${CYAN}uninstall${NC}"
+    echo -e "  ${CYAN}selfsteal status${NC}  | ${CYAN}logs${NC} | ${CYAN}test${NC} | ${CYAN}restart${NC} | ${CYAN}hy2${NC} | ${CYAN}uninstall${NC}"
     echo ""
+    if [[ "$WANT_HY2" == 1 ]]; then
+        run_hy2
+    elif [[ -f "$RN_COMPOSE" ]]; then
+        echo -e "${GRAY}Сертификат для Hysteria2 позже: selfsteal hy2${NC}"
+    fi
+}
+
+# cmd_hy2 — для уже установленного selfsteal: сертификат его домена -> Hysteria2
+cmd_hy2() {
+    require_root
+    [[ -f "$APP_DIR/.env" ]] || err "Selfsteal не установлен — сначала: bash $0 install"
+    DOMAIN="$(. "$APP_DIR/.env"; echo "$SELF_STEAL_DOMAIN")"
+    [[ -f "$RN_COMPOSE" ]] || err "Нет $RN_COMPOSE — remnanode не установлен"
+    write_hy2_tool
+    run_hy2
 }
 
 cmd_uninstall() {
@@ -1049,7 +1243,11 @@ cmd_uninstall() {
     read -rp "Точно удалить? [y/N]: " c
     [[ "$c" =~ ^[Yy]$ ]] || exit 0
     cd "$APP_DIR" && docker compose down -v 2>/dev/null
-    rm -rf "$APP_DIR" "$BIN_PATH" "$SOCK_PATH"
+    if [[ -f /etc/selfsteal-hy2.conf ]]; then
+        "$HY2_BIN" off >/dev/null 2>&1 || true
+        warn "Сертификат Hysteria2 в /etc/hysteria2/certs больше не будет продлеваться"
+    fi
+    rm -rf "$APP_DIR" "$BIN_PATH" "$SOCK_PATH" "$HY2_BIN"
     ok "Удалено"
 }
 
@@ -1061,6 +1259,7 @@ cmd_help() {
 
   install      установить (по умолчанию)
   uninstall    удалить полностью
+  hy2          сертификат домена selfsteal для Hysteria2 в remnanode (+ автопродление)
   help         эта справка
 
 После установки используй команду: ${CYAN}selfsteal${NC}
@@ -1075,6 +1274,7 @@ HELP
 case "${1:-install}" in
     install|"")  cmd_install ;;
     uninstall)   cmd_uninstall ;;
+    hy2)         cmd_hy2 ;;
     help|-h|--help) cmd_help ;;
     *) err "Неизвестная команда: $1" ;;
 esac
