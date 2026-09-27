@@ -19,7 +19,14 @@ HTML_DIR="$APP_DIR/html"
 LOG_DIR="$APP_DIR/logs"
 DATA_DIR="$APP_DIR/data"
 BIN_PATH="/usr/local/bin/selfsteal"
-SCRIPT_VERSION="3.1"
+SOCK_PATH="/dev/shm/selfsteal.sock"
+SCRIPT_VERSION="3.2"
+# v3.2: HTTPS fakesite слушает ТОЛЬКО 127.0.0.1 (или unix-сокет) — наружу открыт лишь :80 для
+# Let's Encrypt. HTTP/3 (UDP) выключен: REALITY ходит к dest только по TCP, а UDP-сокет Caddy
+# на 443 конфликтовал бы с Hysteria2. Неинтерактивный запуск — переменные SELFSTEAL_*:
+#   SELFSTEAL_DOMAIN, SELFSTEAL_MODE=tcp|unix, SELFSTEAL_PORT (tcp, по умолчанию 8443), SELFSTEAL_TEMPLATE=1..6
+# Только для тестового стенда: SELFSTEAL_TLS_INTERNAL=1 (сертификат своего CA Caddy, без Let's Encrypt),
+# SELFSTEAL_SKIP_DNS=1 (без проверки A-записи).
 
 err() { echo -e "${RED}✗ $1${NC}" >&2; exit 1; }
 ok()  { echo -e "${GREEN}✓ $1${NC}"; }
@@ -50,38 +57,63 @@ install_docker_if_needed() {
 
 check_dns() {
     local domain=$1
+    if [[ "${SELFSTEAL_SKIP_DNS:-0}" == "1" ]]; then warn "Проверка DNS пропущена (SELFSTEAL_SKIP_DNS=1)"; return; fi
     local server_ip=$(curl -s --max-time 5 -4 https://api.ipify.org 2>/dev/null || curl -s --max-time 5 -4 https://ifconfig.me 2>/dev/null)
-    local domain_ip=$(dig +short A "$domain" @1.1.1.1 2>/dev/null | tail -1)
+    # v3.2: ВСЕ A-записи (раньше — только последняя: при нескольких записях проверка была лотереей)
+    local domain_ips=$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | sort -u)
     # fallback, если dig не установлен (минимальные образы без dnsutils)
-    [[ -z "$domain_ip" ]] && domain_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+    [[ -z "$domain_ips" ]] && domain_ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
 
     [[ -z "$server_ip" ]] && err "Не могу определить IP сервера"
-    [[ -z "$domain_ip" ]] && err "DNS A-записи для $domain не найдено"
+    [[ -z "$domain_ips" ]] && err "DNS A-записи для $domain не найдено"
 
-    echo "  IP сервера: $server_ip"
-    echo "  IP домена:  $domain_ip"
-    [[ "$server_ip" != "$domain_ip" ]] && err "DNS не указывает на этот сервер"
+    echo "  IP сервера:  $server_ip"
+    echo "  A-записи:    $(echo $domain_ips)"
+    grep -qx "$server_ip" <<<"$domain_ips" || err "Ни одна A-запись $domain не указывает на этот сервер"
+    [[ $(wc -l <<<"$domain_ips") -gt 1 ]] && warn "У домена несколько A-записей — Let's Encrypt может проверить другой IP"
     ok "DNS корректный"
 }
 
+# tcp_owner <порт> — кто слушает TCP-порт (пусто — свободен)
+tcp_owner() {
+    ss -tlnpH "sport = :$1" 2>/dev/null | grep -oE 'users:\(\("[^"]+"' | head -1 | cut -d'"' -f2
+}
+
+# check_ports <mode> <port> — v3.2: только TCP (UDP Caddy больше не слушает); порт, занятый Xray, не отбираем
 check_ports() {
-    local port=$1
-    if ss -tuln 2>/dev/null | grep -qE ":(80|${port}) "; then
-        warn "Порт 80 или $port занят"
-        ss -tlnp 2>/dev/null | grep -E ":(80|${port}) " | head -3
-        read -rp "Остановить занявшие процессы (caddy/nginx/apache)? [y/N]: " stop
-        if [[ "$stop" =~ ^[Yy]$ ]]; then
-            systemctl stop nginx caddy apache2 2>/dev/null || true
-            sleep 1
-            ss -tuln 2>/dev/null | grep -qE ":(80|${port}) " && err "Порт всё ещё занят"
-        else
-            err "Освободи порты и запусти снова"
-        fi
+    local mode=$1 port=$2 p owner
+    for p in 80 $([ "$mode" = tcp ] && echo "$port"); do
+        [[ -z "$(tcp_owner "$p")" ]] && continue
+        owner="$(tcp_owner "$p")"
+        case "$owner" in
+            xray|rw-core|sing-box|hysteria)
+                err "Порт $p занят VPN-ядром ($owner). Для dest выбери другой порт (например 8443), а 443 оставь Xray" ;;
+        esac
+        warn "Порт $p занят: $owner"
+        read -rp "Остановить nginx/caddy/apache2? [y/N]: " stop
+        [[ "$stop" =~ ^[Yy]$ ]] || err "Освободи порт $p и запусти снова"
+        systemctl stop nginx caddy apache2 2>/dev/null || true
+        sleep 1
+        [[ -n "$(tcp_owner "$p")" ]] && err "Порт $p всё ещё занят"
+    done
+    ok "Порты свободны"
+}
+
+choose_mode() {
+    MODE="${SELFSTEAL_MODE:-}"
+    if [[ -z "$MODE" ]]; then
+        echo ""
+        echo -e "${YELLOW}Как Xray будет обращаться к fakesite (dest):${NC}"
+        printf "  ${BLUE}1)${NC} 127.0.0.1:порт ${GRAY}— просто, работает сразу (по умолчанию)${NC}\n"
+        printf "  ${BLUE}2)${NC} unix-сокет $SOCK_PATH ${GRAY}— без TCP-порта; в docker-compose remnanode нужен volume /dev/shm:/dev/shm${NC}\n"
+        read -rp "Вариант [1]: " m
+        case "${m:-1}" in 1) MODE=tcp ;; 2) MODE=unix ;; *) err "Некорректный выбор" ;; esac
     fi
-    ok "Порты 80 и $port свободны"
+    [[ "$MODE" == tcp || "$MODE" == unix ]] || err "SELFSTEAL_MODE: tcp или unix"
 }
 
 choose_template() {
+    if [[ -n "${SELFSTEAL_TEMPLATE:-}" ]]; then TEMPLATE="$SELFSTEAL_TEMPLATE"; else
     echo ""
     echo -e "${YELLOW}Выберите шаблон fakesite:${NC}"
     echo ""
@@ -94,6 +126,7 @@ choose_template() {
     echo ""
     read -rp "Шаблон [1]: " TEMPLATE
     TEMPLATE=${TEMPLATE:-1}
+    fi
 
     case "$TEMPLATE" in
         1) TEMPLATE_NAME="SaaS Cloud" ;;
@@ -696,18 +729,36 @@ HTML
 # ============================================
 
 write_caddyfile() {
-    local domain=$1
-    local port=$2
+    local domain=$1 mode=$2 port=$3 site bind tls=""
+    if [[ "$mode" == unix ]]; then
+        site="https://${domain}"; bind="unix/${SOCK_PATH}"
+    else
+        site="https://${domain}:${port}"; bind="127.0.0.1"
+    fi
+    [[ "${SELFSTEAL_TLS_INTERNAL:-0}" == "1" ]] && tls="    tls internal   # ТОЛЬКО тестовый стенд (SELFSTEAL_TLS_INTERNAL=1)"
 
     cat > "$APP_DIR/Caddyfile" << CADDY
 {
     email admin@${domain}
     http_port 80
-    https_port ${port}
     storage file_system /data
+    # v3.2: без HTTP/3 — REALITY ходит к dest только по TCP; UDP-сокет Caddy не нужен
+    # (на 443 он столкнулся бы с Hysteria2, на другом порту — лишний открытый наружу порт)
+    servers {
+        protocols h1 h2
+    }
 }
 
-${domain}$([ "$port" != "443" ] && echo ":${port}") {
+# :80 открыт наружу — выпуск/продление сертификата Let's Encrypt (HTTP-01) и редирект браузеров
+# на https://домен (443 = Xray REALITY: чужие подключения он проксирует в этот же fakesite)
+http://${domain} {
+    redir https://{host}{uri} permanent
+}
+
+# HTTPS fakesite — ТОЛЬКО локально: ${bind}. Снаружи недоступен, в него ходит лишь Xray (dest)
+${site} {
+    bind ${bind}
+${tls}
     root * /srv
     try_files {path} {path}.html {path}/index.html
     file_server
@@ -740,7 +791,9 @@ CADDY
 }
 
 write_compose() {
-    cat > "$APP_DIR/docker-compose.yml" << 'COMPOSE'
+    local mode=$1 shm=""
+    [[ "$mode" == unix ]] && shm="      - /dev/shm:/dev/shm   # unix-сокет dest ($SOCK_PATH) виден Xray в remnanode"
+    cat > "$APP_DIR/docker-compose.yml" << COMPOSE
 services:
   caddy:
     image: caddy:2-alpine
@@ -755,8 +808,11 @@ services:
       - ./html:/srv:ro
       - ./data:/data
       - ./logs:/logs
+${shm}
+    # v3.2: проверка через admin API Caddy (127.0.0.1:2019). Раньше — http://localhost:80, который
+    # отвечает редиректом на https без сертификата для localhost: контейнер числился unhealthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -770,14 +826,18 @@ COMPOSE
 }
 
 write_env() {
-    local domain=$1
-    local port=$2
+    local domain=$1 mode=$2 port=$3
+    # v3.2: значения в кавычках — .env читается через `source` (selfsteal test), а «SaaS Cloud»
+    # без кавычек давал «Cloud: command not found»
     cat > "$APP_DIR/.env" << EOF
-SELF_STEAL_DOMAIN=${domain}
-SELF_STEAL_PORT=${port}
-TEMPLATE=${TEMPLATE_NAME}
-INSTALLED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-SERVER_IP=$(curl -s --max-time 3 -4 https://api.ipify.org 2>/dev/null)
+SELF_STEAL_DOMAIN="${domain}"
+SELF_STEAL_MODE="${mode}"
+SELF_STEAL_PORT="${port}"
+SELF_STEAL_SOCK="${SOCK_PATH}"
+SELF_STEAL_TLS_INTERNAL="${SELFSTEAL_TLS_INTERNAL:-0}"
+TEMPLATE="${TEMPLATE_NAME}"
+INSTALLED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+SERVER_IP="$(curl -s --max-time 3 -4 https://api.ipify.org 2>/dev/null)"
 EOF
 }
 
@@ -823,9 +883,17 @@ case "$1" in
     config)       cat "$APP_DIR/Caddyfile" ;;
     env)          cat "$APP_DIR/.env" ;;
     test)
+        # v3.2: fakesite слушает только локально — проверяем через 127.0.0.1 / сокет с нужным SNI;
+        # без -k: заодно видно, что сертификат настоящий (кроме тестового tls internal)
         source "$APP_DIR/.env"
-        echo "Testing https://${SELF_STEAL_DOMAIN}:${SELF_STEAL_PORT}..."
-        curl -sIk --max-time 5 "https://${SELF_STEAL_DOMAIN}:${SELF_STEAL_PORT}" | head -5
+        k=""; [ "${SELF_STEAL_TLS_INTERNAL:-0}" = 1 ] && k="-k"
+        if [ "${SELF_STEAL_MODE:-tcp}" = unix ]; then
+            echo "Testing https://${SELF_STEAL_DOMAIN} via ${SELF_STEAL_SOCK}..."
+            curl -sI $k --max-time 5 --unix-socket "$SELF_STEAL_SOCK" "https://${SELF_STEAL_DOMAIN}/" | head -5
+        else
+            echo "Testing https://${SELF_STEAL_DOMAIN}:${SELF_STEAL_PORT} via 127.0.0.1..."
+            curl -sI $k --max-time 5 --resolve "${SELF_STEAL_DOMAIN}:${SELF_STEAL_PORT}:127.0.0.1" "https://${SELF_STEAL_DOMAIN}:${SELF_STEAL_PORT}/" | head -5
+        fi
         ;;
     edit)         ${EDITOR:-nano} "$APP_DIR/Caddyfile" && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile ;;
     uninstall)
@@ -833,7 +901,7 @@ case "$1" in
         [[ "$c" =~ ^[Yy]$ ]] || exit 0
         docker compose down -v 2>/dev/null
         rm -rf "$APP_DIR"
-        rm -f /usr/local/bin/selfsteal
+        rm -f /usr/local/bin/selfsteal /dev/shm/selfsteal.sock
         echo "Удалено."
         ;;
     *)
@@ -871,19 +939,31 @@ cmd_install() {
 
     if [[ -d "$APP_DIR" ]]; then
         warn "Selfsteal уже установлен в $APP_DIR"
-        read -rp "Переустановить? [y/N]: " ow
+        if [[ "${SELFSTEAL_REINSTALL:-0}" == "1" ]]; then ow=y; else read -rp "Переустановить? [y/N]: " ow; fi
         [[ "$ow" =~ ^[Yy]$ ]] || exit 0
-        cd "$APP_DIR" && docker compose down 2>/dev/null
-        rm -rf "$APP_DIR"
+        (cd "$APP_DIR" && docker compose down 2>/dev/null) || true
+        # v3.2: data/ (сертификат и аккаунт Let's Encrypt) сохраняем — раньше каждая переустановка
+        # выпускала сертификат заново и упиралась в лимит Let's Encrypt (5 одинаковых в неделю)
+        find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf {} +
+        rm -f "$SOCK_PATH"
     fi
 
-    echo ""
-    read -rp "Введи домен (например, de1.example.com): " DOMAIN
+    DOMAIN="${SELFSTEAL_DOMAIN:-}"
+    if [[ -z "$DOMAIN" ]]; then
+        echo ""
+        read -rp "Введи домен (например, de1.example.com): " DOMAIN
+    fi
     [[ -z "$DOMAIN" ]] && err "Домен пустой"
 
-    read -rp "Порт для Caddy SSL [443]: " PORT
-    PORT=${PORT:-443}
-    [[ "$PORT" =~ ^[0-9]+$ ]] || err "Некорректный порт"
+    choose_mode
+    PORT=""
+    if [[ "$MODE" == tcp ]]; then
+        PORT="${SELFSTEAL_PORT:-}"
+        # v3.2: по умолчанию 8443 — 443 нужен Xray REALITY; порт всё равно слушается только на 127.0.0.1
+        [[ -z "$PORT" ]] && read -rp "Локальный порт fakesite (127.0.0.1) [8443]: " PORT
+        PORT=${PORT:-8443}
+        [[ "$PORT" =~ ^[0-9]+$ ]] || err "Некорректный порт"
+    fi
 
     choose_template
 
@@ -891,7 +971,7 @@ cmd_install() {
     check_dns "$DOMAIN"
 
     info "Проверяю порты..."
-    check_ports "$PORT"
+    check_ports "$MODE" "$PORT"
 
     install_docker_if_needed
 
@@ -912,40 +992,51 @@ cmd_install() {
     esac
 
     write_robots_sitemap "$DOMAIN"
-    write_caddyfile "$DOMAIN" "$PORT"
-    write_compose
-    write_env "$DOMAIN" "$PORT"
+    write_caddyfile "$DOMAIN" "$MODE" "$PORT"
+    write_compose "$MODE"
+    write_env "$DOMAIN" "$MODE" "$PORT"
     install_cli
 
     info "Запускаю Docker..."
     cd "$APP_DIR"
     docker compose up -d > /dev/null 2>&1
 
-    info "Жду получения SSL сертификата (до 60 сек)..."
-    local ok_ssl=false
-    for i in $(seq 1 30); do
-        if curl -sk --max-time 3 "https://${DOMAIN}:${PORT}" -o /dev/null 2>&1; then
-            ok_ssl=true
-            break
+    info "Жду получения SSL сертификата (до 90 сек)..."
+    local ok_ssl=false k="" probe
+    [[ "${SELFSTEAL_TLS_INTERNAL:-0}" == "1" ]] && k="-k"
+    for i in $(seq 1 45); do
+        # v3.2: локально (127.0.0.1 / сокет) с SNI домена и БЕЗ -k — «OK» только при настоящем сертификате
+        if [[ "$MODE" == unix ]]; then
+            probe=(--unix-socket "$SOCK_PATH" "https://${DOMAIN}/")
+        else
+            probe=(--resolve "${DOMAIN}:${PORT}:127.0.0.1" "https://${DOMAIN}:${PORT}/")
         fi
+        if curl -s $k --max-time 3 -o /dev/null "${probe[@]}" 2>/dev/null; then ok_ssl=true; break; fi
         sleep 2
     done
 
+    local dest; [[ "$MODE" == unix ]] && dest="$SOCK_PATH" || dest="127.0.0.1:${PORT}"
     echo ""
     echo -e "${GREEN}╔═════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║  Установка завершена                                        ║${NC}"
     echo -e "${GREEN}╚═════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  Домен:     ${CYAN}https://${DOMAIN}$([ "$PORT" != "443" ] && echo ":${PORT}")${NC}"
+    echo -e "  Домен:     ${CYAN}${DOMAIN}${NC}"
     echo -e "  Шаблон:    ${TEMPLATE_NAME}"
     echo -e "  Бренд:     ${BRAND}"
-    echo -e "  Порт:      ${PORT}"
+    echo -e "  fakesite:  ${dest} (только локально; наружу открыт лишь :80 для Let's Encrypt)"
     echo -e "  Каталог:   ${APP_DIR}"
-    [[ "$ok_ssl" == "true" ]] && echo -e "  SSL:       ${GREEN}OK${NC}" || echo -e "  SSL:       ${YELLOW}проверь selfsteal logs${NC}"
+    [[ "$ok_ssl" == "true" ]] && echo -e "  SSL:       ${GREEN}OK${NC}" || echo -e "  SSL:       ${YELLOW}ещё нет — selfsteal logs (порт 80 должен быть открыт снаружи)${NC}"
     echo ""
     echo -e "${YELLOW}Reality inbound (Remnawave):${NC}"
-    echo -e "  dest:        ${CYAN}127.0.0.1:${PORT}${NC}"
+    echo -e "  dest:        ${CYAN}${dest}${NC}"
     echo -e "  serverNames: ${CYAN}[\"${DOMAIN}\"]${NC}"
+    if [[ "$MODE" == unix ]]; then
+        echo ""
+        echo -e "${YELLOW}Для unix-сокета в docker-compose.yml remnanode добавь и перезапусти ноду:${NC}"
+        echo -e "  ${CYAN}volumes:${NC}"
+        echo -e "  ${CYAN}  - /dev/shm:/dev/shm${NC}"
+    fi
     echo ""
     echo -e "${GRAY}Управление:${NC}"
     echo -e "  ${CYAN}selfsteal status${NC}  | ${CYAN}logs${NC} | ${CYAN}test${NC} | ${CYAN}restart${NC} | ${CYAN}uninstall${NC}"
@@ -958,7 +1049,7 @@ cmd_uninstall() {
     read -rp "Точно удалить? [y/N]: " c
     [[ "$c" =~ ^[Yy]$ ]] || exit 0
     cd "$APP_DIR" && docker compose down -v 2>/dev/null
-    rm -rf "$APP_DIR" "$BIN_PATH"
+    rm -rf "$APP_DIR" "$BIN_PATH" "$SOCK_PATH"
     ok "Удалено"
 }
 
