@@ -22,7 +22,7 @@ BIN_PATH="/usr/local/bin/selfsteal"
 SOCK_PATH="/dev/shm/selfsteal.sock"
 HY2_BIN="/usr/local/sbin/selfsteal-hy2"
 RN_COMPOSE="/opt/remnanode/docker-compose.yml"
-SCRIPT_VERSION="3.3"
+SCRIPT_VERSION="3.4"
 # v3.2: HTTPS fakesite слушает ТОЛЬКО 127.0.0.1 (или unix-сокет) — наружу открыт лишь :80 для
 # Let's Encrypt. HTTP/3 (UDP) выключен: REALITY ходит к dest только по TCP, а UDP-сокет Caddy
 # на 443 конфликтовал бы с Hysteria2. Неинтерактивный запуск — переменные SELFSTEAL_*:
@@ -65,7 +65,9 @@ check_dns() {
     # v3.3: все IPv4 сервера — внешний (ipify) + адреса на интерфейсах. Раньше сравнивался только
     # внешний: на сервере с дополнительным IP домен на втором адресе ошибочно считался «чужим»
     local public_ip=$(curl -s --max-time 5 -4 https://api.ipify.org 2>/dev/null || curl -s --max-time 5 -4 https://ifconfig.me 2>/dev/null)
-    local server_ips=$( { grep -E '^[0-9.]+$' <<<"$public_ip"; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'; } | sort -u)
+    # v3.4: только публичные адреса интерфейсов — docker0 (172.17.0.1) и прочие частные в список не идут
+    local server_ips=$( { grep -E '^[0-9.]+$' <<<"$public_ip"; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' \
+        | grep -vE '^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'; } | sort -u)
     # v3.2: ВСЕ A-записи (раньше — только последняя: при нескольких записях проверка была лотереей)
     local domain_ips=$(dig +short A "$domain" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | sort -u)
     # fallback, если dig не установлен (минимальные образы без dnsutils)
@@ -76,13 +78,27 @@ check_dns() {
 
     echo "  IP сервера:  $(echo $server_ips)"
     echo "  A-записи:    $(echo $domain_ips)"
-    if [[ -z "$(comm -12 <(echo "$server_ips") <(echo "$domain_ips"))" ]]; then
+    local ans=n mine others
+    mine=$(comm -12 <(echo "$server_ips") <(echo "$domain_ips"))
+    others=$(comm -13 <(echo "$server_ips") <(echo "$domain_ips"))
+    if [[ -z "$mine" ]]; then
         # IP за NAT провайдера может не быть ни на интерфейсе, ни во внешней проверке
         warn "Ни одна A-запись $domain не совпадает с IP этого сервера"
-        local ans=n
         [[ -t 0 ]] && read -rp "  Домен точно указывает на этот сервер (IP за NAT)? Продолжить? [y/N]: " ans
         [[ "$ans" =~ ^[yYдД] ]] || err "Направьте A-запись $domain на этот сервер (или SELFSTEAL_SKIP_DNS=1, если IP за NAT)"
         warn "Продолжаю по подтверждению: если домен ведёт не сюда, Let's Encrypt не выдаст сертификат"
+        return
+    fi
+    if [[ -n "$others" ]]; then
+        # v3.4: домен ведёт ЕЩЁ И на другие серверы. Let's Encrypt проверяет домен по любой из A-записей —
+        # попадёт на чужой сервер, и сертификат не выдастся (выпуск и продление — через раз). v3.3 это
+        # предупреждение потерял. Нужна своя A-запись (свой поддомен) для каждого сервера.
+        warn "$domain указывает ещё и на другой сервер: $(echo $others)"
+        echo "  Let's Encrypt проверяет домен по любой A-записи: попадёт туда — сертификат не выдастся (через раз)."
+        echo "  Нужно: у каждого сервера свой поддомен, одна A-запись — на $(echo $mine)."
+        [[ -t 0 ]] && read -rp "  Удалить лишние A-записи потом / это тоже этот сервер? Продолжить? [y/N]: " ans
+        [[ "$ans" =~ ^[yYдД] ]] || err "Оставьте у $domain одну A-запись: $(echo $mine) (или SELFSTEAL_SKIP_DNS=1)"
+        warn "Продолжаю по подтверждению: пока у $domain есть чужие A-записи, сертификат может не выдаться"
         return
     fi
     ok "DNS корректный"
